@@ -44,116 +44,7 @@ from joblib import Parallel, delayed
 # To avoid unnecessary warning messages
 warnings.simplefilter(action='ignore')
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Auxiliary function (worker for parallel execution)
-# ──────────────────────────────────────────────────────────────────────────────
-"""
-    Computes mean curvatures for a subset of points.
- 
-    Parameters
-    ----------
-    dados     : (n, m) — full dataset (required to index neighbors)
-    knn_chunk : (n_chunk, k) — indices of k-nearest neighbors for the subset
-    rows_ut   : row indices of the upper triangle of (m × m)
-    cols_ut   : column indices of the upper triangle of (m × m)
- 
-    Returns
-    -------
-    curvatures : (n_chunk,) — mean curvatures
-"""
-def _chunk_curvatures(dados: np.ndarray, knn_chunk: np.ndarray, rows_ut: np.ndarray, cols_ut: np.ndarray) -> np.ndarray:    
-    n_chunk = knn_chunk.shape[0]
-    m = dados.shape[1]
-    curvatures = np.empty(n_chunk)
-    # Main loop 
-    for ci in range(n_chunk):
-        idx = knn_chunk[ci]
-        amostras = dados[idx]
-        # ── 1. Symmetric covariance matrix ──────────────────────────────
-        Icov = np.cov(amostras.T) if len(idx) > 1 else np.eye(m)
-        # ── 2. Spectral decomposition via eigh ──────────────────────────
-        # eigh (vs eig): exploits symmetry → ~2× faster, always real.
-        # Returns eigenvalues in *ascending* order; we reverse the columns.
-        _, w = np.linalg.eigh(Icov)
-        Wpca = w[:, ::-1]                          # descending order (m, m)
-        # ── 3. Construction of H = [Squared | Cross] without Python loops ─
-        # Squared[:, j] = Wpca[:, j] ** 2  →  vectorized over all j
-        Squared = Wpca ** 2                        # (m, m)
-        # Cross[:, col] = Wpca[:, j] * Wpca[:, l]  for pairs (j, l) with j < l
-        # rows_ut / cols_ut are precomputed with np.triu_indices
-        Cross = Wpca[:, rows_ut] * Wpca[:, cols_ut]  # (m, nc)
-        H = np.concatenate([Squared, Cross], axis=1)  # (m, m + nc)
-        # ── 4. Curvature: |trace(-H H^T Icov)| via einsum ────────────────
-        # Equivalence:
-        #   trace(H H^T Icov) = Σ_ij (H H^T)_ij * Icov_ji
-        #                     = einsum('ia,ja,ij->', H, H, Icov)
-        # Avoids two dense matrix multiplications + a call to np.trace.
-        curvatures[ci] = abs(np.einsum('ia,ja,ij->', H, H, Icov))
-    return curvatures
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main function
-# ──────────────────────────────────────────────────────────────────────────────
-"""
-    Computes the mean curvature at each point of a multivariate dataset.
- 
-    Parameters
-    ----------
-    dados  : array (n, m) — n samples with m features
-    k      : number of nearest neighbors
-    n_jobs : number of parallel workers.
-             1  → sequential (default, zero overhead).
-             -1 → uses all available CPUs.
-             Recommended to use n_jobs > 1 only for n >= 5000 with many CPUs.
- 
-    Returns
-    -------
-    curvatures : array (n,) — mean curvatures (absolute values)
- 
-    Optimizations relative to the original version
-    ───────────────────────────────────────────────
-    1. eigh instead of eig
-       The covariance matrix is symmetric positive semi-definite.
-       `eigh` exploits this: it is ~2× faster than `eig` and returns
-       real eigenvalues directly (no need for `.real`).
- 
-    2. Elimination of inner Python loops (Squared / Cross)
-       `Squared` is computed via elementwise broadcasting (Wpca**2).
-       `Cross`   is computed by indexing columns with precomputed
-       index arrays (np.triu_indices), in a single vectorized operation.
- 
-    3. No unnecessary allocations per iteration
-       The columns of 1's and the columns of Wpca that were previously
-       concatenated at the beginning of Q, but later discarded in
-       H = Q[:, m+1:], are completely removed — H is built directly.
- 
-    4. einsum for the trace
-       `trace(H H^T Icov)` is computed as
-       `einsum('ia,ja,ij->', H, H, Icov)`,
-       avoiding two dense matrix multiplications and a call to
-       `np.trace`.
- 
-    5. Optional parallelism via joblib
-       The main loop can be distributed across threads (GIL released by
-       NumPy) to leverage multiple CPUs on large datasets.
-"""
-def Mean_Curvatures_Parallel(dados: np.ndarray, k: int, n_jobs: int = 1) -> np.ndarray:
-    n, m = dados.shape
-    # Precomputed upper triangle indices (reused at each iteration)
-    rows_ut, cols_ut = np.triu_indices(m, k=1)
-    # KNN
-    nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(dados)
-    knn_indices = nbrs.kneighbors(return_distance=False)   # (n, k)
-    # Sequential (default) or parallel execution
-    n_jobs_eff = max(1, os.cpu_count() if n_jobs == -1 else n_jobs)
-    if n_jobs_eff == 1:
-        return _chunk_curvatures(dados, knn_indices, rows_ut, cols_ut)
-    chunks = np.array_split(knn_indices, n_jobs_eff)
-    results = Parallel(n_jobs=n_jobs_eff, prefer='threads')(
-        delayed(_chunk_curvatures)(dados, chunk, rows_ut, cols_ut)
-        for chunk in chunks
-    )
-    return np.concatenate(results)
 
 """
 Mean_Curvatures — version 2  (handles high dimensionality)
@@ -386,7 +277,7 @@ def normalize_curvatures(curv, a, b):
 #################################################
 # Data loading
 #################################################
-#X = skdata.fetch_openml(name='Speech', version=1)
+X = skdata.fetch_openml(name='Speech', version=1)
 #X = skdata.fetch_openml(name='madelon', version=1)
 #X = skdata.fetch_openml(name='har', version=1)
 #X = skdata.fetch_openml(name='isolet', version=1)
@@ -396,7 +287,7 @@ def normalize_curvatures(curv, a, b):
 #X = skdata.fetch_openml(name='micro-mass', version=1)
 #X = skdata.fetch_openml(name='MNIST_784', version=1)
 #X = skdata.fetch_openml(name='Fashion-MNIST', version=1)
-X = skdata.fetch_openml(name='Kuzushiji-MNIST', version=1)
+#X = skdata.fetch_openml(name='Kuzushiji-MNIST', version=1)
 #X = skdata.fetch_openml(name='UMIST_Faces_Cropped', version=1)
 #X = skdata.fetch_openml(name='Olivetti_Faces', version=1)
 #X = skdata.fetch_openml(name='DLBCL', version=1)
@@ -455,9 +346,11 @@ start = time.time()
 curvatures_f = Mean_Curvatures(dados, nn, n_jobs=-1)
 end = time.time()
 print('Elapsed time in local curvatures estimation (fast - MeCuCo): ', (end-start))
+
 # # If interquartile range is small compared to the full range, use a log transform to compress curvatures  
 # if iqr(curvatures_f)/(curvatures_f.max() - curvatures_f.min()) < 0.1:
 #     curvatures_f = log(1 + curvatures_f)
+
 # Curvature normalization
 K_f = normalize_curvatures(curvatures_f, 0, 1)  # with normalization
 #K_f = curvatures_f                             # without normalization
@@ -466,4 +359,3 @@ print('Average curvature \u00B1 Std. Dev.: %.4f \u00B1 %.4f' %(K_f.mean(), K_f.s
 print('25% quantile: ', np.quantile(K_f, 0.25))
 print('50% quantile: ', np.quantile(K_f, 0.5))
 print('75% quantile: ', np.quantile(K_f, 0.75))
-#print('95% quantile: ', np.quantile(K_f, 0.95))
